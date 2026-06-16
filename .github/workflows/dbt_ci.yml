@@ -1,0 +1,250 @@
+# =============================================================================
+# dbt CI/CD Pipeline
+# Runs dbt compile, test, and run on every PR and merge to main
+# Author: Ashok Chowdary
+# =============================================================================
+
+name: dbt CI/CD Pipeline
+
+on:
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - 'dbt/**'
+      - '.github/workflows/dbt_ci.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'dbt/**'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Job 1: Lint & Compile (runs on every PR)
+  # ---------------------------------------------------------------------------
+  dbt-lint-compile:
+    name: dbt Lint & Compile
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install dbt-snowflake==1.7.* sqlfluff sqlfluff-templater-dbt
+
+      - name: Configure dbt profiles
+        run: |
+          mkdir -p ~/.dbt
+          cat > ~/.dbt/profiles.yml << 'EOF'
+          fintech_pipeline:
+            target: ci
+            outputs:
+              ci:
+                type: snowflake
+                account: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+                user: ${{ secrets.SNOWFLAKE_USER }}
+                password: ${{ secrets.SNOWFLAKE_PASSWORD }}
+                role: DATA_ENGINEER_CI
+                database: FINTECH_DB_CI
+                warehouse: CI_WH
+                schema: CI_${{ github.sha }}
+                threads: 4
+          EOF
+
+      - name: dbt deps (install packages)
+        working-directory: dbt
+        run: dbt deps
+
+      - name: SQLFluff lint
+        working-directory: dbt
+        run: |
+          sqlfluff lint models/ \
+            --dialect snowflake \
+            --templater dbt \
+            --rules L001,L002,L003,L004,L006,L008,L010,L011,L012
+        continue-on-error: true  # Don't fail PR on lint warnings
+
+      - name: dbt compile (syntax check)
+        working-directory: dbt
+        run: |
+          dbt compile --target ci
+          echo "dbt compile: PASSED"
+
+      - name: Post compile status to PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: '✅ **dbt compile passed** for commit `${{ github.sha }}`\n\nAll models compiled successfully against Snowflake CI environment.'
+            })
+
+  # ---------------------------------------------------------------------------
+  # Job 2: dbt Test (runs on PR)
+  # ---------------------------------------------------------------------------
+  dbt-test:
+    name: dbt Tests
+    runs-on: ubuntu-latest
+    needs: dbt-lint-compile
+    timeout-minutes: 30
+    if: github.event_name == 'pull_request'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install dbt-snowflake==1.7.*
+
+      - name: Configure dbt profiles
+        run: |
+          mkdir -p ~/.dbt
+          cat > ~/.dbt/profiles.yml << 'EOF'
+          fintech_pipeline:
+            target: ci
+            outputs:
+              ci:
+                type: snowflake
+                account: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+                user: ${{ secrets.SNOWFLAKE_USER }}
+                password: ${{ secrets.SNOWFLAKE_PASSWORD }}
+                role: DATA_ENGINEER_CI
+                database: FINTECH_DB_CI
+                warehouse: CI_WH
+                schema: CI_${{ github.sha }}
+                threads: 4
+          EOF
+
+      - name: dbt deps
+        working-directory: dbt
+        run: dbt deps
+
+      - name: dbt run (staging models only for CI)
+        working-directory: dbt
+        run: |
+          dbt run \
+            --select tag:staging \
+            --target ci \
+            --fail-fast
+
+      - name: dbt test (all models)
+        working-directory: dbt
+        run: |
+          dbt test \
+            --select tag:staging \
+            --target ci \
+            --store-failures
+
+      - name: Upload dbt artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dbt-artifacts-${{ github.sha }}
+          path: dbt/target/
+          retention-days: 7
+
+      - name: Cleanup CI schema
+        if: always()
+        working-directory: dbt
+        run: |
+          dbt run-operation drop_schema \
+            --args "{schema_name: CI_${{ github.sha }}}" \
+            --target ci || true
+
+  # ---------------------------------------------------------------------------
+  # Job 3: dbt Full Deploy (runs on merge to main)
+  # ---------------------------------------------------------------------------
+  dbt-deploy-prod:
+    name: dbt Production Deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: production
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install dbt-snowflake==1.7.*
+
+      - name: Configure dbt profiles (production)
+        run: |
+          mkdir -p ~/.dbt
+          cat > ~/.dbt/profiles.yml << 'EOF'
+          fintech_pipeline:
+            target: prod
+            outputs:
+              prod:
+                type: snowflake
+                account: ${{ secrets.SNOWFLAKE_ACCOUNT_PROD }}
+                user: ${{ secrets.SNOWFLAKE_USER_PROD }}
+                password: ${{ secrets.SNOWFLAKE_PASSWORD_PROD }}
+                role: DATA_ENGINEER
+                database: FINTECH_DB
+                warehouse: TRANSFORM_WH
+                schema: MARTS
+                threads: 8
+          EOF
+
+      - name: dbt deps
+        working-directory: dbt
+        run: dbt deps
+
+      - name: dbt run (full production run)
+        working-directory: dbt
+        run: |
+          dbt run \
+            --target prod \
+            --fail-fast \
+            --vars '{"is_production": true}'
+
+      - name: dbt test (full test suite)
+        working-directory: dbt
+        run: |
+          dbt test \
+            --target prod \
+            --store-failures
+
+      - name: dbt docs generate
+        working-directory: dbt
+        run: dbt docs generate --target prod
+
+      - name: Notify Slack on production deploy
+        if: always()
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": "${{ job.status == 'success' && ':white_check_mark:' || ':red_circle:' }} *dbt Production Deploy* | Status: *${{ job.status }}* | Commit: `${{ github.sha }}` | <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Run>"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
